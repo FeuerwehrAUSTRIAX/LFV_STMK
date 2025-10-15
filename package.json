@@ -1,7 +1,7 @@
 {
   "name": "feuerwehr-discord-bot",
   "version": "1.0.0",
-  "description": "Discord-Bot zur Alarmierung der Feuerwehr mit Voralarm- und Einsatzlogik",
+  "description": "Feuerwehr Alarmierungsbot für Discord",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
