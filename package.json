@@ -1,0 +1,16 @@
+{
+  "name": "feuerwehr-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord-Bot zur Alarmierung der Feuerwehr mit Voralarm- und Einsatzlogik",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.11.0",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
