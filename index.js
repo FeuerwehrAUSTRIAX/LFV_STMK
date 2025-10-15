@@ -2,17 +2,16 @@ require('dotenv').config();
 const {
   Client,
   GatewayIntentBits,
-  Partials,
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  Events,
-  StringSelectMenuBuilder,
+  Collection,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  InteractionType
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder
 } = require('discord.js');
 
 const client = new Client({
@@ -20,262 +19,321 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent
-  ],
-  partials: [Partials.Channel]
+  ]
 });
 
 // === KONSTANTEN ===
-const ID_CHANNEL_ALARM = '1388070050061221990';            // Voralarm-Kanal
-const ID_CHANNEL_ALARMIERUNG = '1294270624255971439';      // Detail-/Alarmierungskanal
-const ID_CHANNEL_ZIEL = '1294003170116239431';             // Zielkanal
-const ID_ROLE_NACHALARM = '1293999568991555667';
+const SOURCE_CHANNEL_ID = '1388070050061221990';   // Voralarm-Kanal
+const ALARMIERUNG_CHANNEL_ID = '1294270624255971439'; // Einsatz-Details-Kanal
+const TARGET_CHANNEL_ID = '1294003170116239431';   // Zielkanal
+const NACHALARM_ROLE_ID = '1293999568991555667';
 
-// === IN-MEMORY MAPS ===
-const voralarme = new Map(); // Voralarm-ID -> Objekt
-const dispatchGroups = new Map(); // Dispatch number -> Objekt
+// === SPEICHER ===
+const responseTracker = new Collection(); // Voralarme & Nachalarme
+const dispatchGroups = new Collection();  // Einsätze (Dispatch numbers)
 
-// === HILFSFUNKTIONEN ===
-function makeRsvpButtons(dispatchNumber = null) {
-  const yesId = dispatchNumber ? `rsvp_yes_${dispatchNumber}` : `rsvp_yes`;
-  const noId = dispatchNumber ? `rsvp_no_${dispatchNumber}` : `rsvp_no`;
-  const laterId = dispatchNumber ? `rsvp_later_${dispatchNumber}` : `rsvp_later`;
+// === UTILS ===
+const matchVoralarmByStichwort = (a, b) => {
+  if (!a || !b) return false;
+  return a.toLowerCase().includes(b.toLowerCase()) || b.toLowerCase().includes(a.toLowerCase());
+};
 
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(yesId).setLabel('✅ Zusagen').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(noId).setLabel('❌ Absagen').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(laterId).setLabel('🟠 Komme später').setStyle(ButtonStyle.Primary)
-  );
-}
+// === STARTUP ===
+client.once('ready', async () => {
+  console.log(`✅ Bot ist online als ${client.user.tag}`);
 
-function applyRsvpFields(embed, rsvpObj) {
-  embed.setFields(
-    { name: '✅ Zusagen', value: rsvpObj.yes.size ? Array.from(rsvpObj.yes).map(u => `<@${u}>`).join('\n') : '—', inline: true },
-    { name: '❌ Absagen', value: rsvpObj.no.size ? Array.from(rsvpObj.no).map(u => `<@${u}>`).join('\n') : '—', inline: true },
-    { name: '🟠 Komme später', value: rsvpObj.later.size ? Array.from(rsvpObj.later).map(u => `<@${u}>`).join('\n') : '—', inline: true }
-  );
-}
-
-function scheduleVoralarmCleanup(key, ms = 5 * 60 * 1000) {
-  setTimeout(() => {
-    const obj = voralarme.get(key);
-    if (obj && !obj.closed) {
-      obj.embed.setTitle(`⚠️ Keine weiteren Details (PLZ ${obj.plz})`);
-      obj.closed = true;
-      obj.message.edit({ embeds: [obj.embed], components: [] }).catch(console.error);
-      voralarme.delete(key);
+  try {
+    const channel = await client.channels.fetch(TARGET_CHANNEL_ID);
+    const pinned = await channel.messages.fetchPinned();
+    for (const msg of pinned.values()) {
+      await msg.unpin();
     }
-  }, ms);
-}
 
-function scheduleDispatchCleanup(dispatchNumber, ms = 2 * 60 * 60 * 1000) {
-  setTimeout(() => {
-    dispatchGroups.delete(dispatchNumber);
-  }, ms);
-}
+    const selectMenu = new StringSelectMenuBuilder()
+      .setCustomId('select_startup_alarmtype')
+      .setPlaceholder('Nachalarmierung starten...')
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('Stiller Alarm').setValue('Stiller Alarm'),
+        new StringSelectMenuOptionBuilder().setLabel('Sirenenalarm').setValue('Sirenenalarm')
+      );
 
-// === VORALARM ANLEGEN ===
-async function createVoralarm(msg, { stichwort, plz, time }) {
-  const embed = new EmbedBuilder()
-    .setTitle(`🚨 Voralarm (PLZ ${plz})`)
-    .setDescription(`**Stichwort:** ${stichwort}\n**Zeit:** ${time}`)
-    .setColor('Yellow');
+    const row = new ActionRowBuilder().addComponents(selectMenu);
+    const startupMessage = await channel.send({
+      content: `Nachalarmierung starten:`,
+      components: [row]
+    });
 
-  const rsvpObj = { yes: new Set(), no: new Set(), later: new Set() };
-  applyRsvpFields(embed, rsvpObj);
-  const row = makeRsvpButtons();
+    await startupMessage.pin();
+    console.log('📌 Startup-Nachalarmierungsnachricht gesendet & gepinnt.');
+  } catch (err) {
+    console.error('❌ Fehler bei Startup-Nachricht:', err.message);
+  }
+});
 
-  const zielChannel = await client.channels.fetch(ID_CHANNEL_ZIEL);
-  const sent = await zielChannel.send({ embeds: [embed], components: [row] });
+// === VORALARM HANDLER ===
+client.on('messageCreate', async (message) => {
+  if (message.channel.id !== SOURCE_CHANNEL_ID) return;
+  if (message.author.bot && !message.webhookId) return;
 
-  voralarme.set(sent.id, {
-    message: sent,
-    embed,
-    stichwort,
-    plz,
-    rsvp: rsvpObj,
-    closed: false
+  const removePrefix = text =>
+    text
+      .replace(/Ehrenamt Alarmierung: FF Wiener Neustadt\s*-*\s*/gi, '')
+      .replace(/^(\*{1,2}\s*[-–]*\s*)+/g, '')
+      .trim();
+
+  let descriptionText = '';
+  if (message.content?.trim()) {
+    descriptionText = removePrefix(message.content.trim());
+  } else if (message.embeds.length > 0) {
+    const firstEmbed = message.embeds[0];
+    if (firstEmbed.title || firstEmbed.description) {
+      descriptionText = [
+        firstEmbed.title ? removePrefix(firstEmbed.title) : '',
+        firstEmbed.description ? removePrefix(firstEmbed.description) : ''
+      ].filter(Boolean).join('\n\n');
+    } else descriptionText = '🔗 Nachricht enthält ein eingebettetes Element.';
+  } else if (message.attachments.size > 0) {
+    const attachment = message.attachments.first();
+    descriptionText = `📎 Anhang: ${attachment.name || attachment.url}`;
+  } else {
+    descriptionText = '⚠️ Kein sichtbarer Nachrichtentext vorhanden.';
+  }
+
+  const timestamp = new Date().toLocaleString('de-AT', {
+    dateStyle: 'short',
+    timeStyle: 'short'
   });
 
-  scheduleVoralarmCleanup(sent.id);
-}
-
-// === ALARMIERUNG VERARBEITEN ===
-async function handleAlarmierung(msg, { stichwort, plz, alarmcode, issue, dispatchNumber, fahrzeug }) {
-  const zielChannel = await client.channels.fetch(ID_CHANNEL_ZIEL);
-
-  let matched = null;
-  for (const [_, obj] of voralarme.entries()) {
-    if (!obj.closed && obj.plz === plz && obj.stichwort === stichwort) {
-      matched = obj;
-      break;
-    }
-  }
-
-  if (matched) {
-    matched.closed = true;
-    voralarme.delete(matched.message.id);
-
-    const embed = matched.embed
-      .setTitle(`🚒 Einsatz #${dispatchNumber}`)
-      .setDescription(`**Alarmcode:** ${alarmcode}\n**PLZ:** ${plz}\n**Stichwort / Issue:** ${issue}`)
-      .setColor('Orange');
-
-    const fahrzeuge = new Set();
-    if (fahrzeug) fahrzeuge.add(fahrzeug);
-
-    const grp = {
-      dispatchNumber,
-      message: matched.message,
-      embed,
-      fahrzeuge,
-      rsvp: matched.rsvp
-    };
-    dispatchGroups.set(dispatchNumber, grp);
-    scheduleDispatchCleanup(dispatchNumber);
-
-    embed.addFields({ name: '🚑 Alarmierte Fahrzeuge', value: fahrzeug });
-    applyRsvpFields(embed, grp.rsvp);
-    const row = makeRsvpButtons(dispatchNumber);
-
-    await matched.message.edit({ embeds: [embed], components: [row] });
-  } else {
-    const embed = new EmbedBuilder()
-      .setTitle(`🚒 Einsatz #${dispatchNumber}`)
-      .setDescription(`**Alarmcode:** ${alarmcode}\n**PLZ:** ${plz}\n**Stichwort / Issue:** ${issue}`)
-      .setColor('Red');
-
-    const rsvpObj = { yes: new Set(), no: new Set(), later: new Set() };
-    const fahrzeuge = new Set();
-    if (fahrzeug) fahrzeuge.add(fahrzeug);
-
-    embed.addFields({ name: '🚑 Alarmierte Fahrzeuge', value: fahrzeug || '—' });
-    applyRsvpFields(embed, rsvpObj);
-    const row = makeRsvpButtons(dispatchNumber);
-
-    const sent = await zielChannel.send({ embeds: [embed], components: [row] });
-
-    dispatchGroups.set(dispatchNumber, {
-      dispatchNumber,
-      message: sent,
-      embed,
-      fahrzeuge,
-      rsvp: rsvpObj
-    });
-    scheduleDispatchCleanup(dispatchNumber);
-  }
-}
-
-// === STARTUP: Nachalarmierungs-Nachricht + PIN ===
-client.once(Events.ClientReady, async () => {
-  console.log(`✅ Bot ist online als ${client.user.tag}`);
-  const channel = await client.channels.fetch(ID_CHANNEL_ZIEL);
-
-  const select = new StringSelectMenuBuilder()
-    .setCustomId('nachalarm_select')
-    .setPlaceholder('Nachalarmierung starten …')
-    .addOptions(
-      { label: 'Stiller Alarm', value: 'stiller' },
-      { label: 'Sirenenalarm', value: 'sirene' }
+  const embed = new EmbedBuilder()
+    .setColor(0xE67E22)
+    .setTitle('Ehrenamt Alarmierung: FF Wiener Neustadt')
+    .setDescription(`${descriptionText}\n\n${timestamp}`)
+    .addFields(
+      { name: '✅ Zusagen', value: 'Niemand bisher', inline: true },
+      { name: '❌ Absagen', value: 'Niemand bisher', inline: true },
+      { name: '🟠 Komme später', value: 'Niemand bisher', inline: true }
     );
 
-  const row = new ActionRowBuilder().addComponents(select);
-  const sent = await channel.send({ content: 'Nachalarmierung starten:', components: [row] });
-  await sent.pin();
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('come_yes').setLabel('✅ Ich komme').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('come_no').setLabel('❌ Ich komme nicht').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('come_late').setLabel('🟠 Ich komme später').setStyle(ButtonStyle.Primary)
+  );
+
+  try {
+    const targetChannel = await client.channels.fetch(TARGET_CHANNEL_ID);
+    const sentMessage = await targetChannel.send({
+      embeds: [embed],
+      components: [buttons],
+      allowedMentions: { parse: [] }
+    });
+
+    const plz = descriptionText.match(/\b\d{4,5}\b/)?.[0];
+    const stichwort = descriptionText.split(' ')[0] || 'Unbekannt';
+
+    const timeout = setTimeout(async () => {
+      try {
+        const updated = EmbedBuilder.from(embed)
+          .setTitle('⚠️ Keine weiteren Details')
+          .setColor(0xffaa00);
+        await sentMessage.edit({ embeds: [updated], components: [] });
+      } catch (e) {
+        console.error('Timeout-Update fehlgeschlagen:', e);
+      }
+    }, 2 * 60 * 1000);
+
+    responseTracker.set(sentMessage.id, {
+      message: sentMessage,
+      coming: [],
+      notComing: [],
+      late: [],
+      stichwort,
+      plz,
+      timeout
+    });
+
+    console.log('📢 Voralarm empfangen & gesendet.');
+  } catch (err) {
+    console.error('❌ Fehler beim Senden:', err.message);
+  }
 });
 
-// === MESSAGE HANDLER ===
-client.on(Events.MessageCreate, async (msg) => {
-  if (msg.author.bot) return;
+// === EINSATZDATEN HANDLER ===
+client.on('messageCreate', async (message) => {
+  if (message.channel.id !== ALARMIERUNG_CHANNEL_ID) return;
+  if (message.author.bot && !message.webhookId) return;
+  if (!message.content) return;
 
-  if (msg.channelId === ID_CHANNEL_ALARM) {
-    const m = msg.content.match(/(.+?)\s+PLZ\s+(\d{4,5}).*?(\d{1,2}:\d{2})/);
-    if (m) {
-      const [_, stichwort, plz, time] = m;
-      await createVoralarm(msg, { stichwort, plz, time });
+  const content = message.content;
+  const match = content.match(/Dispatch number:\s*(\d+).*?Alarmcode:\s*(\S+).*?Stichwort:\s*(.+?)\s*\|.*?PLZ:\s*(\d{4,5})(?:.*?Fahrzeug:\s*(.+))?/i);
+  if (!match) return;
+
+  const [, dispatchNumber, alarmcode, stichwortRaw, plz, fahrzeugRaw] = match;
+  const stichwort = stichwortRaw.trim();
+  const fahrzeug = fahrzeugRaw?.trim();
+
+  let einsatz = dispatchGroups.get(dispatchNumber);
+
+  if (!einsatz) {
+    // Passenden Voralarm finden
+    let matchedVoralarmId;
+    for (const [id, entry] of responseTracker) {
+      if (!entry.stichwort || !entry.plz) continue;
+      if (entry.plz === plz && matchVoralarmByStichwort(entry.stichwort, stichwort)) {
+        matchedVoralarmId = id;
+        break;
+      }
     }
+
+    let embed;
+    let messageToEdit;
+    if (matchedVoralarmId) {
+      const entry = responseTracker.get(matchedVoralarmId);
+      clearTimeout(entry.timeout);
+      embed = EmbedBuilder.from(entry.message.embeds[0]);
+      messageToEdit = entry.message;
+      embed.setTitle(`🚒 Einsatz #${dispatchNumber}`);
+      responseTracker.delete(matchedVoralarmId);
+    } else {
+      embed = new EmbedBuilder()
+        .setTitle(`🚒 Einsatz #${dispatchNumber}`)
+        .setColor(0xff0000);
+      const channel = await client.channels.fetch(TARGET_CHANNEL_ID);
+      messageToEdit = await channel.send({ embeds: [embed] });
+    }
+
+    einsatz = {
+      dispatchNumber,
+      message: messageToEdit,
+      embed,
+      fahrzeuge: new Set(),
+      coming: [],
+      notComing: [],
+      late: []
+    };
+    dispatchGroups.set(dispatchNumber, einsatz);
+    setTimeout(() => dispatchGroups.delete(dispatchNumber), 2 * 60 * 60 * 1000);
   }
 
-  if (msg.channelId === ID_CHANNEL_ALARMIERUNG) {
-    const m = msg.content.match(/Dispatch number:\s*(\d+).*?Alarmcode:\s*(\S+).*?Stichwort:\s*(.+?)\s*\|.*?PLZ:\s*(\d{4,5})(?:.*?Fahrzeug:\s*(.+))?/);
-    if (m) {
-      const [_, dispatchNumber, alarmcode, stichwort, plz, fahrzeug] = m;
-      await handleAlarmierung(msg, { dispatchNumber, alarmcode, stichwort, plz, issue: stichwort, fahrzeug });
-    }
-  }
+  if (fahrzeug) einsatz.fahrzeuge.add(fahrzeug);
+
+  const fahrzeugList = Array.from(einsatz.fahrzeuge).join('\n') || '—';
+
+  const updatedEmbed = EmbedBuilder.from(einsatz.embed)
+    .setDescription(`**Alarmcode:** ${alarmcode}\n**PLZ:** ${plz}\n**Stichwort:** ${stichwort}`)
+    .setFields(
+      { name: '🚑 Alarmierte Fahrzeuge', value: fahrzeugList, inline: false },
+      { name: '✅ Zusagen', value: einsatz.coming.length ? einsatz.coming.map(id => `<@${id}>`).join('\n') : 'Niemand bisher', inline: true },
+      { name: '❌ Absagen', value: einsatz.notComing.length ? einsatz.notComing.map(id => `<@${id}>`).join('\n') : 'Niemand bisher', inline: true },
+      { name: '🟠 Komme später', value: einsatz.late.length ? einsatz.late.map(id => `<@${id}>`).join('\n') : 'Niemand bisher', inline: true }
+    )
+    .setColor(0xff0000);
+
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`come_yes_${dispatchNumber}`).setLabel('✅ Ich komme').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`come_no_${dispatchNumber}`).setLabel('❌ Ich komme nicht').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`come_late_${dispatchNumber}`).setLabel('🟠 Ich komme später').setStyle(ButtonStyle.Primary)
+  );
+
+  await einsatz.message.edit({ embeds: [updatedEmbed], components: [buttons] });
+  einsatz.embed = updatedEmbed;
+  console.log(`🚒 Einsatz #${dispatchNumber} aktualisiert (${fahrzeug || 'kein neues Fahrzeug'})`);
 });
 
-// === INTERACTION HANDLER ===
-client.on(Events.InteractionCreate, async (interaction) => {
+// === BUTTON HANDLER ===
+client.on('interactionCreate', async (interaction) => {
   if (interaction.isButton()) {
-    const cid = interaction.customId;
-    const [_, type, dispatchNumber] = cid.split('_');
+    const id = interaction.customId;
     const userId = interaction.user.id;
+    let entry;
 
-    let obj = dispatchNumber
-      ? dispatchGroups.get(dispatchNumber)
-      : voralarme.get(interaction.message.id);
-
-    if (!obj) {
-      await interaction.reply({ content: '⛔ Ungültige oder abgelaufene Nachricht.', ephemeral: true });
-      return;
+    // Voralarm oder Einsatz?
+    if (id.startsWith('come_') && !id.match(/_\d+$/)) {
+      entry = responseTracker.get(interaction.message.id);
+    } else {
+      const dispatchNumber = id.split('_').pop();
+      entry = dispatchGroups.get(dispatchNumber);
     }
 
-    obj.rsvp.yes.delete(userId);
-    obj.rsvp.no.delete(userId);
-    obj.rsvp.later.delete(userId);
+    if (!entry) return interaction.reply({ content: '⛔ Diese Meldung ist nicht mehr aktiv.', ephemeral: true });
 
-    if (type === 'yes') obj.rsvp.yes.add(userId);
-    if (type === 'no') obj.rsvp.no.add(userId);
-    if (type === 'later') obj.rsvp.later.add(userId);
+    // Reset user from lists
+    entry.coming = entry.coming.filter(u => u !== userId);
+    entry.notComing = entry.notComing.filter(u => u !== userId);
+    entry.late = entry.late.filter(u => u !== userId);
 
-    applyRsvpFields(obj.embed, obj.rsvp);
-    const row = makeRsvpButtons(dispatchNumber);
-    await interaction.update({ embeds: [obj.embed], components: [row] });
+    if (id.includes('yes')) entry.coming.push(userId);
+    if (id.includes('no')) entry.notComing.push(userId);
+    if (id.includes('late')) entry.late.push(userId);
+
+    const embed = EmbedBuilder.from(interaction.message.embeds[0]).setFields(
+      { name: '✅ Zusagen', value: entry.coming.length ? entry.coming.map(id => `<@${id}>`).join('\n') : 'Niemand bisher', inline: true },
+      { name: '❌ Absagen', value: entry.notComing.length ? entry.notComing.map(id => `<@${id}>`).join('\n') : 'Niemand bisher', inline: true },
+      { name: '🟠 Komme später', value: entry.late.length ? entry.late.map(id => `<@${id}>`).join('\n') : 'Niemand bisher', inline: true }
+    );
+
+    await interaction.message.edit({ embeds: [embed] });
+    await interaction.reply({ content: 'Antwort gespeichert 🙌', ephemeral: true });
   }
 
-  if (interaction.isStringSelectMenu() && interaction.customId === 'nachalarm_select') {
-    const mode = interaction.values[0]; // "stiller" oder "sirene"
-    const modal = new ModalBuilder()
-      .setCustomId(`nachalarm_modal_${mode}`)
-      .setTitle('Nachalarmierung');
+  // === NACHALARM SELECT + MODAL ===
+  if (interaction.isStringSelectMenu() && interaction.customId === 'select_startup_alarmtype') {
+    const selected = interaction.values[0];
+    const modal = new ModalBuilder().setCustomId('nachalarm_modal').setTitle('Nachalarmierung');
 
-    const stichwort = new TextInputBuilder().setCustomId('nach_stichwort').setLabel('Stichwort').setStyle(TextInputStyle.Short).setRequired(true);
-    const adresse = new TextInputBuilder().setCustomId('nach_adresse').setLabel('Adresse').setStyle(TextInputStyle.Short).setRequired(true);
-    const info = new TextInputBuilder().setCustomId('nach_info').setLabel('Weitere Info').setStyle(TextInputStyle.Paragraph).setRequired(false);
+    const stichwort = new TextInputBuilder().setCustomId('stichwort').setLabel('Stichwort').setStyle(TextInputStyle.Short).setRequired(true);
+    const adresse = new TextInputBuilder().setCustomId('adresse').setLabel('Adresse').setStyle(TextInputStyle.Short).setRequired(true);
+    const info = new TextInputBuilder().setCustomId('info').setLabel('Weitere Infos').setStyle(TextInputStyle.Paragraph);
 
-    const modalRows = [stichwort, adresse, info].map(component => new ActionRowBuilder().addComponents(component));
-    modal.addComponents(...modalRows);
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(stichwort),
+      new ActionRowBuilder().addComponents(adresse),
+      new ActionRowBuilder().addComponents(info)
+    );
+
+    interaction.client.alarmType = selected;
     await interaction.showModal(modal);
   }
 
-  if (interaction.type === InteractionType.ModalSubmit && interaction.customId.startsWith('nachalarm_modal_')) {
-    const mode = interaction.customId.split('_').pop();
-    const stichwort = interaction.fields.getTextInputValue('nach_stichwort');
-    const adresse = interaction.fields.getTextInputValue('nach_adresse');
-    const info = interaction.fields.getTextInputValue('nach_info');
+  if (interaction.isModalSubmit() && interaction.customId === 'nachalarm_modal') {
+    const alarmType = interaction.client.alarmType || 'Unbekannt';
+    const stichwort = interaction.fields.getTextInputValue('stichwort');
+    const adresse = interaction.fields.getTextInputValue('adresse');
+    const info = interaction.fields.getTextInputValue('info');
 
     const embed = new EmbedBuilder()
-      .setTitle(`📣 Nachalarmierung: ${stichwort}`)
-      .setDescription(`**Adresse:** ${adresse}\n${info ? `**Info:** ${info}` : ''}`)
-      .setColor(mode === 'sirene' ? 'DarkRed' : 'Blue');
+      .setColor(0xff9900)
+      .setTitle(`📣 Nachalarmierung: FF Wiener Neustadt`)
+      .setDescription(`**${alarmType}**: ${stichwort}\n📍 ${adresse}\n${info}`)
+      .addFields(
+        { name: '✅ Zusagen', value: 'Niemand bisher', inline: true },
+        { name: '❌ Absagen', value: 'Niemand bisher', inline: true },
+        { name: '🟠 Komme später', value: 'Niemand bisher', inline: true }
+      );
 
-    const rsvpObj = { yes: new Set(), no: new Set(), later: new Set() };
-    applyRsvpFields(embed, rsvpObj);
-    const row = makeRsvpButtons();
+    const buttons = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('come_yes').setLabel('✅ Ich komme').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('come_no').setLabel('❌ Ich komme nicht').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('come_late').setLabel('🟠 Ich komme später').setStyle(ButtonStyle.Primary)
+    );
 
-    const zielChannel = await client.channels.fetch(ID_CHANNEL_ZIEL);
-    await zielChannel.send({
-      content: `<@&${ID_ROLE_NACHALARM}>`,
+    const channel = await client.channels.fetch(TARGET_CHANNEL_ID);
+    const sent = await channel.send({
+      content: `<@&${NACHALARM_ROLE_ID}>`,
       embeds: [embed],
-      components: [row],
+      components: [buttons],
       allowedMentions: { parse: ['roles'] }
     });
 
-    await interaction.reply({ content: '✅ Nachalarmierung gesendet.', ephemeral: true });
+    responseTracker.set(sent.id, {
+      message: sent,
+      coming: [],
+      notComing: [],
+      late: []
+    });
+
+    await interaction.reply({ content: '✅ Nachalarmierung erfolgreich gesendet.', ephemeral: true });
   }
 });
 
-// === LOGIN ===
-client.login(process.env.DISCORD_BOT_TOKEN).catch(err => {
-  console.error('Login fehlgeschlagen:', err);
-});
+client.login(process.env.DISCORD_BOT_TOKEN);
